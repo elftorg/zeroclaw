@@ -1,5 +1,8 @@
 name: build-zeroclaw-for-debian12
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 on:
   workflow_dispatch:
   push:
@@ -25,7 +28,7 @@ jobs:
           cargo -Vv
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Build
         run: |

@@ -1,5 +1,8 @@
 name: build-zeroclaw-for-debian12
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 on:
   workflow_dispatch:
     inputs:
@@ -23,7 +26,7 @@ jobs:
           apt-get install -y curl ca-certificates git build-essential pkg-config perl cmake clang
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust
         run: |
@@ -42,7 +45,6 @@ jobs:
           EXTRA_FEATURES: ${{ github.event.inputs.extra_features }}
         run: |
           set -euo pipefail
-          # Read feature names from Cargo.toml [features] section.
           mapfile -t KNOWN_FEATURES < <(
             awk '
               /^\[features\]/ { in_features=1; next }

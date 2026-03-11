@@ -2,10 +2,10 @@ use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use parking_lot::Mutex;
-use postgres::{Client, NoTls, Row};
-use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::OnceCell;
+use tokio_postgres::{Client, NoTls, Row};
+use tracing::warn;
 use uuid::Uuid;
 
 /// Maximum allowed connect timeout (seconds) to avoid unreasonable waits.
@@ -13,11 +13,14 @@ const POSTGRES_CONNECT_TIMEOUT_CAP_SECS: u64 = 300;
 
 /// PostgreSQL-backed persistent memory.
 ///
-/// This backend focuses on reliable CRUD and keyword recall using SQL, without
-/// requiring extension setup (for example pgvector).
+/// Uses async tokio-postgres client, so it can run safely inside Tokio runtime
+/// without nested runtime panics from blocking adapters.
 pub struct PostgresMemory {
-    client: Arc<Mutex<Client>>,
+    client: OnceCell<Client>,
+    db_url: String,
+    schema_ident: String,
     qualified_table: String,
+    connect_timeout_secs: Option<u64>,
 }
 
 impl PostgresMemory {
@@ -34,73 +37,71 @@ impl PostgresMemory {
         let table_ident = quote_identifier(table);
         let qualified_table = format!("{schema_ident}.{table_ident}");
 
-        let client = Self::initialize_client(
-            db_url.to_string(),
-            connect_timeout_secs,
-            schema_ident.clone(),
-            qualified_table.clone(),
-        )?;
-
         Ok(Self {
-            client: Arc::new(Mutex::new(client)),
+            client: OnceCell::new(),
+            db_url: db_url.to_string(),
+            schema_ident,
             qualified_table,
+            connect_timeout_secs,
         })
     }
 
-    fn initialize_client(
-        db_url: String,
-        connect_timeout_secs: Option<u64>,
-        schema_ident: String,
-        qualified_table: String,
-    ) -> Result<Client> {
-        let init_handle = std::thread::Builder::new()
-            .name("postgres-memory-init".to_string())
-            .spawn(move || -> Result<Client> {
-                let mut config: postgres::Config = db_url
+    async fn client(&self) -> Result<&Client> {
+        self.client
+            .get_or_try_init(|| async {
+                let mut config: tokio_postgres::Config = self
+                    .db_url
                     .parse()
                     .context("invalid PostgreSQL connection URL")?;
 
-                if let Some(timeout_secs) = connect_timeout_secs {
+                if let Some(timeout_secs) = self.connect_timeout_secs {
                     let bounded = timeout_secs.min(POSTGRES_CONNECT_TIMEOUT_CAP_SECS);
                     config.connect_timeout(Duration::from_secs(bounded));
                 }
 
-                let mut client = config
+                let (client, connection) = config
                     .connect(NoTls)
+                    .await
                     .context("failed to connect to PostgreSQL memory backend")?;
 
-                Self::init_schema(&mut client, &schema_ident, &qualified_table)?;
+                tokio::spawn(async move {
+                    if let Err(error) = connection.await {
+                        warn!("PostgreSQL memory connection error: {error}");
+                    }
+                });
+
+                Self::init_schema(&client, &self.schema_ident, &self.qualified_table).await?;
                 Ok(client)
             })
-            .context("failed to spawn PostgreSQL initializer thread")?;
-
-        let init_result = init_handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("PostgreSQL initializer thread panicked"))?;
-
-        init_result
+            .await
     }
 
-    fn init_schema(client: &mut Client, schema_ident: &str, qualified_table: &str) -> Result<()> {
-        client.batch_execute(&format!(
-            "
-            CREATE SCHEMA IF NOT EXISTS {schema_ident};
+    async fn init_schema(
+        client: &Client,
+        schema_ident: &str,
+        qualified_table: &str,
+    ) -> Result<()> {
+        client
+            .batch_execute(&format!(
+                "
+                CREATE SCHEMA IF NOT EXISTS {schema_ident};
 
-            CREATE TABLE IF NOT EXISTS {qualified_table} (
-                id TEXT PRIMARY KEY,
-                key TEXT UNIQUE NOT NULL,
-                content TEXT NOT NULL,
-                category TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL,
-                session_id TEXT
-            );
+                CREATE TABLE IF NOT EXISTS {qualified_table} (
+                    id TEXT PRIMARY KEY,
+                    key TEXT UNIQUE NOT NULL,
+                    content TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL,
+                    session_id TEXT
+                );
 
-            CREATE INDEX IF NOT EXISTS idx_memories_category ON {qualified_table}(category);
-            CREATE INDEX IF NOT EXISTS idx_memories_session_id ON {qualified_table}(session_id);
-            CREATE INDEX IF NOT EXISTS idx_memories_updated_at ON {qualified_table}(updated_at DESC);
-            "
-        ))?;
+                CREATE INDEX IF NOT EXISTS idx_memories_category ON {qualified_table}(category);
+                CREATE INDEX IF NOT EXISTS idx_memories_session_id ON {qualified_table}(session_id);
+                CREATE INDEX IF NOT EXISTS idx_memories_updated_at ON {qualified_table}(updated_at DESC);
+                "
+            ))
+            .await?;
 
         Ok(())
     }
@@ -178,35 +179,29 @@ impl Memory for PostgresMemory {
         category: MemoryCategory,
         session_id: Option<&str>,
     ) -> Result<()> {
-        let client = self.client.clone();
-        let qualified_table = self.qualified_table.clone();
-        let key = key.to_string();
-        let content = content.to_string();
+        let now = Utc::now();
         let category = Self::category_to_str(&category);
+        let id = Uuid::new_v4().to_string();
+        let stmt = format!(
+            "
+            INSERT INTO {table}
+                (id, key, content, category, created_at, updated_at, session_id)
+            VALUES
+                ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (key) DO UPDATE SET
+                content = EXCLUDED.content,
+                category = EXCLUDED.category,
+                updated_at = EXCLUDED.updated_at,
+                session_id = EXCLUDED.session_id
+            ",
+            table = &self.qualified_table
+        );
+        let client = self.client().await?;
         let sid = session_id.map(str::to_string);
-
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let now = Utc::now();
-            let mut client = client.lock();
-            let stmt = format!(
-                "
-                INSERT INTO {qualified_table}
-                    (id, key, content, category, created_at, updated_at, session_id)
-                VALUES
-                    ($1, $2, $3, $4, $5, $6, $7)
-                ON CONFLICT (key) DO UPDATE SET
-                    content = EXCLUDED.content,
-                    category = EXCLUDED.category,
-                    updated_at = EXCLUDED.updated_at,
-                    session_id = EXCLUDED.session_id
-                "
-            );
-
-            let id = Uuid::new_v4().to_string();
-            client.execute(&stmt, &[&id, &key, &content, &category, &now, &now, &sid])?;
-            Ok(())
-        })
-        .await?
+        client
+            .execute(&stmt, &[&id, &key, &content, &category, &now, &now, &sid])
+            .await?;
+        Ok(())
     }
 
     async fn recall(
@@ -215,59 +210,45 @@ impl Memory for PostgresMemory {
         limit: usize,
         session_id: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
-        let client = self.client.clone();
-        let qualified_table = self.qualified_table.clone();
-        let query = query.trim().to_string();
+        let stmt = format!(
+            "
+            SELECT id, key, content, category, created_at, session_id,
+                   (
+                     CASE WHEN key ILIKE '%' || $1 || '%' THEN 2.0 ELSE 0.0 END +
+                     CASE WHEN content ILIKE '%' || $1 || '%' THEN 1.0 ELSE 0.0 END
+                   ) AS score
+            FROM {table}
+            WHERE ($2::TEXT IS NULL OR session_id = $2)
+              AND ($1 = '' OR key ILIKE '%' || $1 || '%' OR content ILIKE '%' || $1 || '%')
+            ORDER BY score DESC, updated_at DESC
+            LIMIT $3
+            ",
+            table = &self.qualified_table
+        );
+        #[allow(clippy::cast_possible_wrap)]
+        let limit_i64 = limit as i64;
         let sid = session_id.map(str::to_string);
-
-        tokio::task::spawn_blocking(move || -> Result<Vec<MemoryEntry>> {
-            let mut client = client.lock();
-            let stmt = format!(
-                "
-                SELECT id, key, content, category, created_at, session_id,
-                       (
-                         CASE WHEN key ILIKE '%' || $1 || '%' THEN 2.0 ELSE 0.0 END +
-                         CASE WHEN content ILIKE '%' || $1 || '%' THEN 1.0 ELSE 0.0 END
-                       ) AS score
-                FROM {qualified_table}
-                WHERE ($2::TEXT IS NULL OR session_id = $2)
-                  AND ($1 = '' OR key ILIKE '%' || $1 || '%' OR content ILIKE '%' || $1 || '%')
-                ORDER BY score DESC, updated_at DESC
-                LIMIT $3
-                "
-            );
-
-            #[allow(clippy::cast_possible_wrap)]
-            let limit_i64 = limit as i64;
-
-            let rows = client.query(&stmt, &[&query, &sid, &limit_i64])?;
-            rows.iter()
-                .map(Self::row_to_entry)
-                .collect::<Result<Vec<MemoryEntry>>>()
-        })
-        .await?
+        let q = query.trim().to_string();
+        let client = self.client().await?;
+        let rows = client.query(&stmt, &[&q, &sid, &limit_i64]).await?;
+        rows.iter()
+            .map(Self::row_to_entry)
+            .collect::<Result<Vec<MemoryEntry>>>()
     }
 
     async fn get(&self, key: &str) -> Result<Option<MemoryEntry>> {
-        let client = self.client.clone();
-        let qualified_table = self.qualified_table.clone();
-        let key = key.to_string();
-
-        tokio::task::spawn_blocking(move || -> Result<Option<MemoryEntry>> {
-            let mut client = client.lock();
-            let stmt = format!(
-                "
-                SELECT id, key, content, category, created_at, session_id
-                FROM {qualified_table}
-                WHERE key = $1
-                LIMIT 1
-                "
-            );
-
-            let row = client.query_opt(&stmt, &[&key])?;
-            row.as_ref().map(Self::row_to_entry).transpose()
-        })
-        .await?
+        let stmt = format!(
+            "
+            SELECT id, key, content, category, created_at, session_id
+            FROM {table}
+            WHERE key = $1
+            LIMIT 1
+            ",
+            table = &self.qualified_table
+        );
+        let client = self.client().await?;
+        let row = client.query_opt(&stmt, &[&key]).await?;
+        row.as_ref().map(Self::row_to_entry).transpose()
     }
 
     async fn list(
@@ -275,67 +256,49 @@ impl Memory for PostgresMemory {
         category: Option<&MemoryCategory>,
         session_id: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
-        let client = self.client.clone();
-        let qualified_table = self.qualified_table.clone();
+        let stmt = format!(
+            "
+            SELECT id, key, content, category, created_at, session_id
+            FROM {table}
+            WHERE ($1::TEXT IS NULL OR category = $1)
+              AND ($2::TEXT IS NULL OR session_id = $2)
+            ORDER BY updated_at DESC
+            ",
+            table = &self.qualified_table
+        );
+
         let category = category.map(Self::category_to_str);
+        let category_ref = category.as_deref();
         let sid = session_id.map(str::to_string);
+        let session_ref = sid.as_deref();
 
-        tokio::task::spawn_blocking(move || -> Result<Vec<MemoryEntry>> {
-            let mut client = client.lock();
-            let stmt = format!(
-                "
-                SELECT id, key, content, category, created_at, session_id
-                FROM {qualified_table}
-                WHERE ($1::TEXT IS NULL OR category = $1)
-                  AND ($2::TEXT IS NULL OR session_id = $2)
-                ORDER BY updated_at DESC
-                "
-            );
-
-            let category_ref = category.as_deref();
-            let session_ref = sid.as_deref();
-            let rows = client.query(&stmt, &[&category_ref, &session_ref])?;
-            rows.iter()
-                .map(Self::row_to_entry)
-                .collect::<Result<Vec<MemoryEntry>>>()
-        })
-        .await?
+        let client = self.client().await?;
+        let rows = client.query(&stmt, &[&category_ref, &session_ref]).await?;
+        rows.iter()
+            .map(Self::row_to_entry)
+            .collect::<Result<Vec<MemoryEntry>>>()
     }
 
     async fn forget(&self, key: &str) -> Result<bool> {
-        let client = self.client.clone();
-        let qualified_table = self.qualified_table.clone();
-        let key = key.to_string();
-
-        tokio::task::spawn_blocking(move || -> Result<bool> {
-            let mut client = client.lock();
-            let stmt = format!("DELETE FROM {qualified_table} WHERE key = $1");
-            let deleted = client.execute(&stmt, &[&key])?;
-            Ok(deleted > 0)
-        })
-        .await?
+        let stmt = format!("DELETE FROM {} WHERE key = $1", self.qualified_table);
+        let client = self.client().await?;
+        let deleted = client.execute(&stmt, &[&key]).await?;
+        Ok(deleted > 0)
     }
 
     async fn count(&self) -> Result<usize> {
-        let client = self.client.clone();
-        let qualified_table = self.qualified_table.clone();
-
-        tokio::task::spawn_blocking(move || -> Result<usize> {
-            let mut client = client.lock();
-            let stmt = format!("SELECT COUNT(*) FROM {qualified_table}");
-            let count: i64 = client.query_one(&stmt, &[])?.get(0);
-            let count =
-                usize::try_from(count).context("PostgreSQL returned a negative memory count")?;
-            Ok(count)
-        })
-        .await?
+        let stmt = format!("SELECT COUNT(*) FROM {}", self.qualified_table);
+        let client = self.client().await?;
+        let count: i64 = client.query_one(&stmt, &[]).await?.get(0);
+        let count = usize::try_from(count).context("PostgreSQL returned a negative memory count")?;
+        Ok(count)
     }
 
     async fn health_check(&self) -> bool {
-        let client = self.client.clone();
-        tokio::task::spawn_blocking(move || client.lock().simple_query("SELECT 1").is_ok())
-            .await
-            .unwrap_or(false)
+        match self.client().await {
+            Ok(client) => client.simple_query("SELECT 1").await.is_ok(),
+            Err(_) => false,
+        }
     }
 }
 
@@ -359,10 +322,7 @@ mod tests {
     #[test]
     fn parse_category_maps_known_and_custom_values() {
         assert_eq!(PostgresMemory::parse_category("core"), MemoryCategory::Core);
-        assert_eq!(
-            PostgresMemory::parse_category("daily"),
-            MemoryCategory::Daily
-        );
+        assert_eq!(PostgresMemory::parse_category("daily"), MemoryCategory::Daily);
         assert_eq!(
             PostgresMemory::parse_category("conversation"),
             MemoryCategory::Conversation
@@ -374,7 +334,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn new_does_not_panic_inside_tokio_runtime() {
+    async fn new_is_lazy_and_non_blocking() {
         let outcome = std::panic::catch_unwind(|| {
             PostgresMemory::new(
                 "postgres://zeroclaw:password@127.0.0.1:1/zeroclaw",
@@ -386,8 +346,8 @@ mod tests {
 
         assert!(outcome.is_ok(), "PostgresMemory::new should not panic");
         assert!(
-            outcome.unwrap().is_err(),
-            "PostgresMemory::new should return a connect error for an unreachable endpoint"
+            outcome.unwrap().is_ok(),
+            "PostgresMemory::new should not connect eagerly"
         );
     }
 }
