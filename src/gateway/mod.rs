@@ -312,6 +312,25 @@ pub struct AppState {
     pub event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
 }
 
+async fn resolve_bind_addr(host: &str, port: u16) -> Result<SocketAddr> {
+    let trimmed = host.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("gateway host is empty");
+    }
+
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+
+    let mut addrs = tokio::net::lookup_host((trimmed, port))
+        .await
+        .with_context(|| format!("failed to resolve gateway host '{trimmed}'"))?;
+
+    addrs
+        .next()
+        .context("resolved host has no socket addresses")
+}
+
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
 #[allow(clippy::too_many_lines)]
 pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
@@ -333,7 +352,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         None
     };
 
-    let addr: SocketAddr = format!("{host}:{port}").parse()?;
+    let addr = resolve_bind_addr(host, port).await?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
