@@ -22,15 +22,64 @@ jobs:
           apt-get update
           apt-get install -y curl ca-certificates git build-essential pkg-config perl cmake clang
 
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           . "$HOME/.cargo/env"
+          RUST_VER="$(sed -n 's/^rust-version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          if [ -n "$RUST_VER" ]; then
+            rustup toolchain install "$RUST_VER" --profile minimal
+            rustup default "$RUST_VER"
+          fi
           rustc -Vv
           cargo -Vv
 
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Validate requested features
+        env:
+          EXTRA_FEATURES: ${{ github.event.inputs.extra_features }}
+        run: |
+          set -euo pipefail
+          # Read feature names from Cargo.toml [features] section.
+          mapfile -t KNOWN_FEATURES < <(
+            awk '
+              /^\[features\]/ { in_features=1; next }
+              /^\[/ && in_features { exit }
+              in_features && /^[A-Za-z0-9_-]+[[:space:]]*=/ {
+                split($0, a, "="); gsub(/[[:space:]]/, "", a[1]); print a[1]
+              }
+            ' Cargo.toml
+          )
+          if [ "${#KNOWN_FEATURES[@]}" -eq 0 ]; then
+            echo "No [features] found in Cargo.toml"; exit 1
+          fi
+
+          check_feature() {
+            local f="$1"
+            for known in "${KNOWN_FEATURES[@]}"; do
+              if [ "$known" = "$f" ]; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          check_feature "memory-postgres" || { echo "Feature 'memory-postgres' not found"; exit 1; }
+
+          if [ -n "${EXTRA_FEATURES:-}" ]; then
+            IFS=',' read -ra EXTRA_ARR <<< "$EXTRA_FEATURES"
+            for raw in "${EXTRA_ARR[@]}"; do
+              f="$(echo "$raw" | xargs)"
+              [ -z "$f" ] && continue
+              if ! check_feature "$f"; then
+                echo "Unknown feature requested: '$f'"
+                echo "Known features: ${KNOWN_FEATURES[*]}"
+                exit 1
+              fi
+            done
+          fi
 
       - name: Build
         env:

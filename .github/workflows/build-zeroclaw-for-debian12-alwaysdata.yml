@@ -1,5 +1,8 @@
 name: build-zeroclaw-for-debian12-alwaysdata
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 on:
   workflow_dispatch:
   push:
@@ -18,7 +21,7 @@ jobs:
           apt-get install -y curl ca-certificates git build-essential pkg-config perl cmake clang
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust (from Cargo.toml rust-version)
         run: |
@@ -32,12 +35,27 @@ jobs:
           rustc -Vv
           cargo -Vv
 
+      - name: Validate required features
+        run: |
+          set -euo pipefail
+          for f in memory-postgres sandbox-bubblewrap rag-pdf channel-lark; do
+            awk -v f="$f" '
+              /^\[features\]/ { in_features=1; next }
+              /^\[/ && in_features { exit }
+              in_features && $0 ~ "^"f"[[:space:]]*=" { found=1 }
+              END { exit found ? 0 : 1 }
+            ' Cargo.toml || { echo "Missing feature in Cargo.toml: $f"; exit 1; }
+          done
+
       - name: Build (alwaysdata feature set)
         run: |
+          set -euo pipefail
           . "$HOME/.cargo/env"
           FEATURES="memory-postgres,sandbox-bubblewrap,rag-pdf,channel-lark"
           echo "Building with features: $FEATURES"
-          cargo build --release --locked --bin zeroclaw --features "$FEATURES"
+          export CARGO_PROFILE_RELEASE_LTO=thin
+          export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=8
+          cargo build --release --bin zeroclaw --features "$FEATURES" 2>&1 | tee /tmp/build.log
           ls -lh target/release/zeroclaw
 
       - name: Strip
