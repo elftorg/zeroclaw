@@ -1,0 +1,49 @@
+name: build-zeroclaw-for-debian12
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:12
+    steps:
+      - name: Install system packages
+        run: |
+          apt-get update
+          apt-get install -y curl ca-certificates git build-essential pkg-config perl cmake clang
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          . "$HOME/.cargo/env"
+          rustc -Vv
+          cargo -Vv
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          . "$HOME/.cargo/env"
+          cargo build --release --locked --bin zeroclaw --features memory-postgres
+          ls -lh target/release/zeroclaw
+
+      - name: Strip
+        run: |
+          strip target/release/zeroclaw || true
+          ls -lh target/release/zeroclaw
+
+      - name: Smoke test binary
+        run: |
+          target/release/zeroclaw --help >/dev/null
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zeroclaw-debian12-x86_64-memory-postgres
+          path: target/release/zeroclaw
