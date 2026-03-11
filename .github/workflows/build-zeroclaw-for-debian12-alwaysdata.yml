@@ -14,6 +14,9 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: debian:12
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Install system packages
         run: |
